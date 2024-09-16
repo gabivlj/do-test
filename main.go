@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -41,7 +42,7 @@ type CallConfig struct {
 
 // Put here the chunk size you want to use. Make sure it matches with your DO chunk size configuration
 // Chunk size max is 128 * 1024
-const chunkSize = 4096
+const chunkSize = 128 * 1024
 
 func must[T any](t T, err error) T {
 	assert("expected action to be successful", err)
@@ -55,10 +56,12 @@ func assert(msg string, err error) {
 }
 
 type result struct {
-	AvgTimePerPush string
-	Error          string
-	TotalTimePush  string
-	ConfigUsed     CallConfig
+	AvgTimePerPush            string
+	Error                     string
+	TotalTimePush             string
+	TotalDataTransferredBytes int64
+	ConcurrentJobs            int
+	ConfigUsed                CallConfig
 }
 
 func main() {
@@ -68,11 +71,11 @@ func main() {
 		// Set here how many chunks you want to send per test
 		// The total data that its going to get sent per test is:
 		//  totalChunks * doValueSize
-		totalChunks: 5000,
+		totalChunks: 200,
 	}
 
 	resultsC := make(chan result, conf.totalChunks*conf.totalChunks)
-	maxConcurrentChunkPushes := 10
+	maxConcurrentChunkPushes := 5
 	uploadTokenC := make(chan struct{}, maxConcurrentChunkPushes)
 	for i := 0; i < maxConcurrentChunkPushes; i++ {
 		uploadTokenC <- struct{}{}
@@ -87,19 +90,27 @@ func main() {
 	// Put here the location of the DO
 	locationHint := "wnam"
 
-	// Try to send 1, 11, 21, 31, 41 chunks at once on each test
-	for i := 0; i < 50; i += 10 {
+	// Try to send 1, 10, 20, 30, 40 chunks at once on each test
+	for i := 0; i <= 50; i += 10 {
+		index := i
+		if i == 0 {
+			index = 1
+		}
+
 		wg := sync.WaitGroup{}
 		c := &CallConfig{
 			ChunkSizeBytes: chunkSize,
-			ChunksPerCall:  int64(i) + 1,
+			ChunksPerCall:  int64(index),
 		}
 
 		client := &http.Client{}
 		base := must(url.JoinPath(conf.url, locationHint+"-location"))
 		entireOp := time.Now()
+		calls := atomic.Uint64{}
+		ops := 0
 		for chunkIndex := int64(0); chunkIndex < conf.totalChunks; chunkIndex += c.ChunksPerCall {
 			chunkIndex := chunkIndex
+			ops++
 			wg.Add(1)
 			go func() {
 				<-uploadTokenC
@@ -137,7 +148,8 @@ func main() {
 
 				res.Body.Close()
 
-				log.Println("Uploading bytes took", time.Since(now), "of chunk", chunkIndex)
+				calls.Add(uint64(time.Since(now)))
+				log.Println("Uploading bytes took", time.Since(now), "of chunk", chunkIndex, "-", max-1)
 			}()
 		}
 
@@ -148,9 +160,11 @@ func main() {
 		}
 
 		results = append(results, result{
-			ConfigUsed:     *c,
-			AvgTimePerPush: (time.Since(entireOp) / time.Duration(conf.totalChunks/c.ChunksPerCall+int64(carry))).String(),
-			TotalTimePush:  time.Since(entireOp).String(),
+			ConfigUsed:                *c,
+			AvgTimePerPush:            time.Duration(calls.Load() / uint64(ops)).String(),
+			TotalTimePush:             time.Since(entireOp).String(),
+			TotalDataTransferredBytes: conf.totalChunks * c.ChunkSizeBytes,
+			ConcurrentJobs:            maxConcurrentChunkPushes,
 		})
 		log.Println("OK, entire operation took", time.Since(entireOp))
 		log.Println("Sent", c.ChunkSizeBytes*conf.totalChunks, "bytes in", c.ChunksPerCall*c.ChunkSizeBytes, "bytes sent per call")

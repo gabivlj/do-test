@@ -21,7 +21,7 @@ export class Block extends DurableObject {
 		}
 
 		const reader = request.body.getReader({ mode: 'byob' });
-		const chunkSize = 4096;
+		const chunkSize = 128 * 1024;
 		const len = +(request.headers.get('Content-Length') ?? '');
 		if (isNaN(len)) {
 			return new Response('NO_CONTENT_LEN', { status: 400 });
