@@ -5,8 +5,14 @@ export interface Env {
 }
 
 export class Block extends DurableObject {
+	sql = this.ctx.storage.sql;
+
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
+
+		ctx.blockConcurrencyWhile(async () => {
+			this.sql.exec('CREATE TABLE IF NOT EXISTS blobs (i INTEGER PRIMARY KEY, blob BLOB);');
+		});
 	}
 
 	async fetch(request: Request<unknown, CfProperties<unknown>>): Promise<Response> {
@@ -14,14 +20,16 @@ export class Block extends DurableObject {
 		const [start, end] = getIndexes(url);
 		if (isNaN(start) || isNaN(end)) return new Response('INDEX_QUERY_MALFORMED', { status: 400 });
 		if (!request.body) return new Response('NEEDS_BODY', { status: 400 });
-		const conf = { allowConcurrency: true, allowUnconfirmed: true };
+		const insertQuery = `INSERT INTO blobs (i, blob) VALUES (?, ?) ON CONFLICT (i) DO UPDATE SET blob = EXCLUDED.blob;`;
+
 		if (start === end) {
-			await this.ctx.storage.put(`BLOCK_${start}`, await request.bytes(), conf);
+			const bytes = await request.bytes();
+			this.sql.exec(insertQuery, start, bytes);
 			return new Response('ok');
 		}
 
 		const reader = request.body.getReader({ mode: 'byob' });
-		const chunkSize = 4096;
+		const chunkSize = 128 * 1024;
 		const len = +(request.headers.get('Content-Length') ?? '');
 		if (isNaN(len)) {
 			return new Response('NO_CONTENT_LEN', { status: 400 });
@@ -29,20 +37,25 @@ export class Block extends DurableObject {
 
 		for (let index = start; index <= end; index++) {
 			const result = await reader.readAtLeast(chunkSize, new Uint8Array(chunkSize));
-			await this.ctx.storage.put(`BLOCK_${index}`, result.value, conf);
+			if (result.done) break;
+			this.sql.exec(insertQuery, index, result.value.buffer);
 		}
 
-		// await this.ctx.storage.sync();
 		return new Response('OK');
 	}
 
 	async get(index: number): Promise<Response> {
-		const blockChunk = await this.ctx.storage.get(`BLOCK_${index}`);
-		if (blockChunk === null || blockChunk === undefined) return new Response('BLOCK_CHUNK_NOT_FOUND', { status: 404 });
-		return new Response(blockChunk as Uint8Array);
+		const res = this.sql.exec('SELECT blob FROM blobs WHERE i = ?', index);
+		const value = res.next();
+		if (value.value !== undefined && value.value['blob'] instanceof ArrayBuffer) {
+			return new Response(value.value['blob']);
+		}
+
+		return new Response('not found', { status: 404 });
 	}
 
 	async free(): Promise<number> {
+		this.sql.exec('DROP TABLE blobs');
 		await this.ctx.storage.deleteAll();
 		return 0;
 	}
@@ -69,11 +82,12 @@ function getIndexes(url: URL) {
 }
 
 export default {
-	async fetch(request, env, ctx): Promise<Response> {
+	async fetch(request, env: Env, ctx): Promise<Response> {
 		try {
 			const url = new URL(request.url);
 			const locationHint = (request.headers.get('X-Location-Hint') ?? 'enam') as DurableObjectLocationHint;
-			const id: DurableObjectId = env.BLOCK.idFromName(getKey(url));
+			const k = getKey(url);
+			const id: DurableObjectId = env.BLOCK.idFromName(k);
 			const stub = env.BLOCK.get(id, { locationHint });
 			if (request.method === 'DELETE') {
 				await stub.free();
